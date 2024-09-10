@@ -1,11 +1,35 @@
+from argparse import Action
 from clang.cindex import Config, Index, CursorKind
+from colorama import init, Fore
 
 from utils import *
 from ccsimobj import *
 
+
+init()
 Config.set_library_file('/usr/lib/llvm-15/lib/libclang.so.1')
 index = Index.create()
 
+def check_gem5_api(func_name):
+    IGNORED_API_LIST = [
+        'getPort',
+        'getAddrRanges'
+    ]
+
+    return func_name in IGNORED_API_LIST
+
+def check_gem5_class(class_name):
+    GEM5_CLASS_LIST = [
+        'System',
+        'ClockedObject',
+        'Port',
+        'Packet',
+        'gem5::PacketPtr',
+        'ClockDomain',
+        'ThreadContext'
+    ]
+
+    return class_name in GEM5_CLASS_LIST
 
 def handle_class_decl(cursor, scope):
     bases = []
@@ -29,11 +53,12 @@ class CursorState:
     cursor = None
     simobj = None
     flowpath = None
+    actspath = None
     namespace = ':'
-    cond_stack = []
     prev_stack = []
 
     global_simobj = SimObjInfo('global', ':')
+    all_actspaths = []
     all_simobjs = [global_simobj]
 
     @staticmethod
@@ -41,20 +66,24 @@ class CursorState:
         CursorState.cursor = None
         CursorState.simobj = None
         CursorState.flowpath = None
+        CursorState.actspath = None
         CursorState.namespace = ':'
-
-        CursorState.cond_stack.clear()
         CursorState.prev_stack.clear()
 
 def handle_funct_decl(cursor, scope):
     flowp = SimFlowPath(cursor.spelling)
+    actsp = ActionFlow(cursor.spelling)
+    actsp.add_block(HEAD_BLOCK)
 
     for child in cursor.get_children():
         if   child.kind == CursorKind.TYPE_REF:
             flowp.field = child.type.spelling
         
         elif child.kind == CursorKind.PARM_DECL:
-            print(f'++Insert Param: {child.spelling}')
+            print(f'++ Insert Param: {child.spelling}, type: {child.type.spelling}')
+            if check_gem5_class(child.type.spelling):
+                print(Fore.GREEN + f'Gem5 Class: {child.type.spelling}, Detected', Fore.RESET)
+            
             flowp.insert(
                 SimVarNode( child.spelling, 
                             child.type, 
@@ -63,7 +92,13 @@ def handle_funct_decl(cursor, scope):
 
         elif child.kind == CursorKind.COMPOUND_STMT:
             CursorState.flowpath = flowp
+            CursorState.actspath = actsp
+            actsp.add_block(EXEC_BLOCK)
             handle_stmt(child, scope)
+    
+    CursorState.all_actspaths.append(actsp)
+    actsp.print_flow()
+    CursorState.actspath = None
 
 def handle_decl(cursor, scope):
     display_info(cursor, scope)
@@ -87,15 +122,20 @@ def handle_decl(cursor, scope):
             if CursorState.flowpath is None:
                 raise RuntimeError(f"Flowpath Not found")
             CursorState.flowpath.insert(node)
+            CursorState.actspath.add_stmt(node)
         
     elif cursor.kind == CursorKind.CLASS_DECL:
         handle_class_decl(cursor, scope)
 
     elif cursor.kind == CursorKind.CONSTRUCTOR:
-        print('!WARNING: Constructor Not Implemented')
+        print(Fore.RED + '!WARNING: Constructor Not Implemented', Fore.RESET)
 
     elif cursor.kind == CursorKind.CXX_METHOD:
         if not cursor.is_definition():
+            return
+        
+        if check_gem5_api(cursor.spelling):
+            print(Fore.GREEN + f'Gem5 API: {cursor.spelling}, Detected', Fore.RESET)
             return
         
         handle_funct_decl(cursor, scope)
@@ -121,8 +161,8 @@ def handle_expr(cursor, scope) -> BaseNode:
     elif cursor.kind == CursorKind.UNARY_OPERATOR:
         children = cursor.get_children()
         oprand = list(cursor.get_tokens())[0]
-        print(f"    >Oprand: {oprand.spelling}")
         s_node = handle_expr(next(children), scope + 1)
+        print(f"    ++ Unary Oprand: {oprand.spelling}")
 
         return UryOpNode(oprand.spelling, s_node)
 
@@ -134,8 +174,8 @@ def handle_expr(cursor, scope) -> BaseNode:
 
         if oprand.spelling == '=':
             l_node.add_relation(r_node)
-        else :
-            return BinOpNode(oprand.spelling, l_node, r_node)
+        
+        return BinOpNode(oprand.spelling, l_node, r_node)
 
     elif cursor.kind == CursorKind.PAREN_EXPR:
         return handle_expr(next(cursor.get_children()), scope + 1)
@@ -175,7 +215,7 @@ def handle_expr(cursor, scope) -> BaseNode:
                          CursorKind.STRING_LITERAL, 
                          CursorKind.CHARACTER_LITERAL, 
                          CursorKind.CXX_BOOL_LITERAL_EXPR, 
-                         CursorKind.CXX_NULL_PTR_LITERAL_EXPR,]:
+                         CursorKind.CXX_NULL_PTR_LITERAL_EXPR]:
         lit = list(cursor.get_tokens())[0]
         return LitNode(cursor.kind.name, lit)
 
@@ -191,7 +231,8 @@ def handle_stmt(cursor, scope):
             handle_stmt(child, scope + 1)
 
     elif cursor.kind.is_expression():
-        handle_expr(cursor, scope)
+        expr = handle_expr(cursor, scope)
+        CursorState.actspath.add_stmt(expr)
 
     elif cursor.kind == CursorKind.IF_STMT:
         children = cursor.get_children()
@@ -199,18 +240,22 @@ def handle_stmt(cursor, scope):
         then_stmt = next(children, None)
         else_stmt = next(children, None)
         # handle condition expression
-        handle_expr(condition, scope + 1)
-        CursorState.cond_stack.append(condition)
+        cond = handle_expr(condition, scope + 1)
+        CursorState.actspath.add_block(BRANCH_BLOCK, cond)
 
         if then_stmt:
             print('>>>Then Stmt>>>')
+            CursorState.actspath.add_branch(EXEC_BLOCK)
             handle_stmt(then_stmt, scope + 1)
+            CursorState.actspath.ret_branch()
 
         if else_stmt:
             print('>>>Else Stmt>>>')
+            CursorState.actspath.add_branch(EXEC_BLOCK)
             handle_stmt(else_stmt, scope + 1)
+            CursorState.actspath.ret_branch()
         
-        CursorState.cond_stack.pop()
+        CursorState.actspath.pop_branch()
 
     elif cursor.kind == CursorKind.FOR_STMT:
         raise NotImplementedError(f"Not Impl for stmt {cursor.kind}")
@@ -225,28 +270,29 @@ def handle_stmt(cursor, scope):
         ret = handle_expr(next(children), scope + 1)
         print(f"    >Return: {ret.name}")
         CursorState.flowpath.insert(ret, is_ouput = True)
+        CursorState.actspath.add_stmt(ret)
 
     else:
         print_tokens(cursor)
         raise NotImplementedError(f"Not Impl stmt {cursor.kind}, is_decl? {cursor.kind.is_declaration()}, is_stmt? {cursor.kind.is_statement()},is_expr? {cursor.kind.is_expression()}")
 
-# TODO : cursorstate的出入栈的问题
-
-def travel_code(cursor, scope):
-    display_info(cursor, scope)
-
+def travel_code(cursor, filename,scope):
+    # display_info(cursor, scope)
     # print(f'    is_define? {cursor.is_definition()}, \
     #         is_decl? {cursor.kind.is_declaration()}, \
     #         is_expr? {cursor.kind.is_expression( )},')
     
     if cursor.kind == CursorKind.TRANSLATION_UNIT:
         for child in cursor.get_children():
-            travel_code(child, scope)
+            if child.location.file.name == filename:
+                travel_code(child,filename, scope)
 
     elif cursor.kind == CursorKind.NAMESPACE:
-        print_children_cnt(cursor)
         print(f'>>>Namespace:  {cursor.spelling}>>>')
         CursorState.namespace = cursor.spelling + ':'
+
+        for child in cursor.get_children():
+            travel_code(child,filename, scope)
 
     elif cursor.kind.is_declaration():
         handle_decl(cursor, scope)
@@ -262,12 +308,18 @@ def travel_code(cursor, scope):
     return
 
 
-# source_code = remove_std_include('/workspaces/gem5-stable/gpower/test/simple_cache.cc')
-# print(source_code)
-tu = index.parse("/workspaces/gem5-stable/gpower/test/simple_cache.cc", args=['-fsyntax-only'])
-# tu = index.parse("main.cc", unsaved_files=[("main.cc", source_code)], args=['-fsyntax-only'])
-print_diagnostic_info(tu)
+source_code = '/workspaces/gem5-stable/gpower/test/cxxmethod.cc'
+# source_code = "/workspaces/gem5-stable/src/learning_gem5/part2/simple_cache.cc"
+args = ['-fsyntax-only', '-I' ,'/workspaces/gem5-stable/src/']
+
+source_code = remove_gem5_macro(source_code)
+#save file
+with open('gpower/main.cc', 'w') as f:
+    f.write(source_code)
+
+# tu = index.parse(source_code, args=args)
+tu = index.parse("main.cc", unsaved_files=[("main.cc", source_code)], args=args)
+# print_diagnostic_info(tu)
 
 CursorState.clear()
-
-travel_code(tu.cursor, 0)
+travel_code(tu.cursor, "main.cc", 0)
